@@ -17,12 +17,16 @@ namespace BitingAxesVR
  double biteReleaseDelay = 1.75;
  double bitePullDistance = 6.0;
  double biteLostDistance = 90.0;
+ double biteVictimMaxDistance = 75.0;
  double biteSafetySeconds = 30.0;
  double biteShakeLoose = 55.0;
  double biteVictimSpeedFrac = 0.0;
  int embedPlayerStaminaDrainEnabled = 1;
  double embedPlayerStaminaDrainPerSec = 2.0;
  int embedStaminaExhaustRelease = 1;
+ int embedWorldModelEnabled = 1;
+ int embedArmsAndHandsEnabled = 0;
+ double embedCooldownSec = 0.5;
 
  double axeMaxInsertFrac = 0.40;
  double axeMinInitialFrac = 0.19;
@@ -42,6 +46,7 @@ namespace BitingAxesVR
  double lodgedHealthDrainPerSec = 0.35;
  double lodgedMagickaDrainPerSec = 0.35;
  double lodgedStaminaDrainPerSec = 0.35;
+ int lodgedHoldStaminaDrainEnabled = 1;
  double lodgedHoldStaminaDrainPerSec = 12.0;
  double lodgedHoldStaminaMin = 0.5;
  double lodgedExtractGrabRadius = 42.0;
@@ -203,6 +208,8 @@ namespace BitingAxesVR
  if (TryParseDouble(value, dVal)) { ClampNonNegative(dVal); bitePullDistance = dVal; }
  } else if (varName == "BiteLostDistance") {
  if (TryParseDouble(value, dVal)) { ClampNonNegative(dVal); biteLostDistance = dVal; }
+ } else if (varName == "BiteVictimMaxDistance") {
+ if (TryParseDouble(value, dVal)) { ClampNonNegative(dVal); biteVictimMaxDistance = dVal; }
  } else if (varName == "BiteSafetySeconds") {
  if (TryParseDouble(value, dVal)) { ClampNonNegative(dVal); biteSafetySeconds = dVal; }
  } else if (varName == "BiteShakeLoose") {
@@ -215,6 +222,12 @@ namespace BitingAxesVR
  if (TryParseDouble(value, dVal)) { ClampNonNegative(dVal); embedPlayerStaminaDrainPerSec = dVal; }
  } else if (varName == "EmbedStaminaExhaustRelease") {
  if (TryParseInt(value, iVal)) embedStaminaExhaustRelease = iVal != 0 ? 1 : 0;
+ } else if (varName == "EmbedWorldModelEnabled") {
+ if (TryParseInt(value, iVal)) embedWorldModelEnabled = iVal != 0 ? 1 : 0;
+ } else if (varName == "EmbedArmsAndHandsEnabled") {
+ if (TryParseInt(value, iVal)) embedArmsAndHandsEnabled = iVal != 0 ? 1 : 0;
+ } else if (varName == "EmbedCooldownSec") {
+ if (TryParseDouble(value, dVal)) { ClampNonNegative(dVal); embedCooldownSec = dVal; }
  } else if (varName == "AxeMaxInsertFrac") {
  if (TryParseDouble(value, dVal)) { axeMaxInsertFrac = dVal; ClampUnitFrac(axeMaxInsertFrac); }
  } else if (varName == "AxeMinInitialFrac") {
@@ -247,6 +260,8 @@ namespace BitingAxesVR
  if (TryParseDouble(value, dVal)) { ClampNonNegative(dVal); lodgedMagickaDrainPerSec = dVal; }
  } else if (varName == "LodgedStaminaDrainPerSec") {
  if (TryParseDouble(value, dVal)) { ClampNonNegative(dVal); lodgedStaminaDrainPerSec = dVal; }
+ } else if (varName == "LodgedHoldStaminaDrainEnabled") {
+ if (TryParseInt(value, iVal)) { lodgedHoldStaminaDrainEnabled = iVal != 0 ? 1 : 0; }
  } else if (varName == "LodgedHoldStaminaDrainPerSec") {
  if (TryParseDouble(value, dVal)) { ClampNonNegative(dVal); lodgedHoldStaminaDrainPerSec = dVal; }
  } else if (varName == "LodgedHoldStaminaMin") {
@@ -279,7 +294,16 @@ namespace BitingAxesVR
  vsnprintf(buffer, sizeof(buffer), fmt, args);
  va_end(args);
 
- IW_LOG_INFO("{}", buffer);
+ if (msgLogLevel <= LOGLEVEL_ERR) {
+ SKSE::log::error("{}", buffer);
+ AppendToPluginLog("ERROR", "%s", buffer);
+ } else if (msgLogLevel <= LOGLEVEL_WARN) {
+ SKSE::log::warn("{}", buffer);
+ AppendToPluginLog("WARN", "%s", buffer);
+ } else {
+ SKSE::log::info("{}", buffer);
+ AppendToPluginLog("INFO", "%s", buffer);
+ }
  }
 
 } // namespace BitingAxesVR

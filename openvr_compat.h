@@ -7,7 +7,7 @@
 namespace OpenVRCompat
 {
     inline constexpr std::uint32_t kInvalidDevice = 0xFFFFFFFFu;
-    inline constexpr std::uint64_t kGripButtonMask = 1ull << 2;      // k_EButton_Grip
+    inline constexpr std::uint64_t kGripButtonMask = 1ull << 2;   // k_EButton_Grip
     inline constexpr std::uint64_t kTriggerButtonMask = 1ull << 33;  // k_EButton_SteamVR_Trigger
 
     struct ControllerAxis

@@ -19,12 +19,16 @@ namespace BitingAxesVR
  extern double biteReleaseDelay;       // seconds after embed before pull-back can release
  extern double bitePullDistance;       // Skyrim units of backward pull required to release
  extern double biteLostDistance;       // controller/wound distance that force-releases embed
+ extern double biteVictimMaxDistance;  // player-to-NPC distance that force-releases standard embed (0 = off)
  extern double biteSafetySeconds;      // hard cap on embed duration
  extern double biteShakeLoose;         // bone jump in one frame that dislodges embed
  extern double biteVictimSpeedFrac;    // 0..1: embedded victim speed cap; 0 = immobilize
  extern int embedPlayerStaminaDrainEnabled; // 1 = drain player stamina during standard embed
  extern double embedPlayerStaminaDrainPerSec;
  extern int embedStaminaExhaustRelease;     // 1 = unembed when player stamina hits 0
+ extern int embedWorldModelEnabled;         // 1 = grip/trigger during NPC embed spawns world weapon
+ extern int embedArmsAndHandsEnabled;       // 1 = allow embeds on NPC upper/forearm (not hands)
+ extern double embedCooldownSec;            // per-hand cooldown after embed ends before next embed
 
  // Axe embed depth (fractions of grip->impact length)
  extern double axeMaxInsertFrac;
@@ -47,6 +51,7 @@ namespace BitingAxesVR
  extern double lodgedHealthDrainPerSec;   // base HP/s; scaled by body region
  extern double lodgedMagickaDrainPerSec; // base magicka/s above legs; scaled by body region
  extern double lodgedStaminaDrainPerSec; // base stamina/s on legs; scaled by body region
+ extern int lodgedHoldStaminaDrainEnabled; // master on/off for player stamina while holding lodged NPC
  extern double lodgedHoldStaminaDrainPerSec;
  extern double lodgedHoldStaminaMin;
  extern double lodgedExtractGrabRadius;

@@ -8,6 +8,7 @@
 #include "engine.h"
 #include "config.h"
 #include "bite.h"
+#include "bitingaxesinterface001.h"
 #include <cstdint>
 #include <fstream>
 #include <cstdlib>
@@ -29,6 +30,9 @@ static void OnSKSEMessage(SKSE::MessagingInterface::Message* msg)
 
 	switch (msg->type) {
 	case SKSE::MessagingInterface::kPostPostLoad: {
+		// Must be first: consumers may fetch this API in their PostPostLoad handler.
+		BitingAxesAPI::RegisterBitingAxesInterface();
+
 		BitingAxesVR::LogFalseEdgeVRStatus();
 
 		// Try to obtain HIGGS interface via SKSE messaging now that PostPostLoad occurred
@@ -54,6 +58,8 @@ static void OnSKSEMessage(SKSE::MessagingInterface::Message* msg)
 		break;
 	}
 	case SKSE::MessagingInterface::kDataLoaded: {
+		BitingAxesAPI::RegisterBitingAxesInterface();
+
 		// Game data has been loaded; load settings and start listening for melee hits
 		IW_LOG_INFO("{}: received kDataLoaded message", BitingAxesVR::kPluginDisplayName);
 		BitingAxesVR::loadConfig();
@@ -78,7 +84,7 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Query(const void* /*a_skse*/, S
 {
 	if (a_info) {
 		a_info->infoVersion = 1; // standard SKSE info version
-		a_info->name = BitingAxesVR::kPluginFileSlug; // shown in loader log
+		a_info->name = BitingAxesVR::kPluginQueryName; // SKSE messaging lookup name (see kInterfaceRecipient)
 		a_info->version = 1;                          // plugin version
 	}
 	return true;
@@ -91,6 +97,16 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
 	SKSE::Init(a_skse);
 
 	SKSE::log::info("{} loaded", BitingAxesVR::kPluginDisplayName);
+
+	// Register SKSE messages during Load (sender "SKSE" is always valid). PostPostLoad handler
+	// registers the mod-support API once every plugin is in the load list.
+	if (auto* messaging = SKSE::GetMessagingInterface()) {
+		if (messaging->RegisterListener("SKSE", OnSKSEMessage)) {
+			IW_LOG_INFO("{}: registered SKSE messaging listener", BitingAxesVR::kPluginDisplayName);
+		} else {
+			IW_LOG_ERROR("{}: failed to register SKSE messaging listener", BitingAxesVR::kPluginDisplayName);
+		}
+	}
 
 	// Remove old plugin log so we replace it on each load
 	const std::string path = BitingAxesVR::GetPluginLogPath();
@@ -115,22 +131,6 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSE::LoadInterface*
 			SKSE::log::info("{}: trampoline created (capacity = {} bytes)", BitingAxesVR::kPluginDisplayName,
 			                trampoline.capacity());
 			IW_LOG_INFO("{}: trampoline created", BitingAxesVR::kPluginDisplayName);
-
-			// Register listener for SKSE messages so we can fetch HIGGS on PostPostLoad and detect DataLoaded
-			auto messaging = SKSE::GetMessagingInterface();
-			if (messaging) {
-				bool reg = messaging->RegisterListener("SKSE", OnSKSEMessage);
-				SKSE::log::info("{}: registered SKSE messaging listener: {}", BitingAxesVR::kPluginDisplayName, reg);
-				if (reg) {
-					IW_LOG_INFO("{}: registered SKSE messaging listener", BitingAxesVR::kPluginDisplayName);
-				} else {
-					IW_LOG_ERROR("{}: failed to register SKSE messaging listener", BitingAxesVR::kPluginDisplayName);
-				}
-			} else {
-				SKSE::log::warn("{}: messaging interface not available during API init",
-				                BitingAxesVR::kPluginDisplayName);
-				IW_LOG_WARN("{}: messaging interface not available during API init", BitingAxesVR::kPluginDisplayName);
-			}
 
 		} catch (const std::exception& e) {
 			SKSE::log::error("{}: trampoline creation failed: {}", BitingAxesVR::kPluginDisplayName, e.what());

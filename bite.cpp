@@ -12,6 +12,7 @@
 #include "engine.h"
 #include "helper.h"
 #include "higgsinterface.h"
+#include "bitingaxesinterface001.h"
 #include "openvr_compat.h"
 #include "planckinterface.h"
 
@@ -296,6 +297,30 @@ namespace
         return form ? form->As<RE::TESObjectWEAP>() : nullptr;
     }
 
+    // Skyrim.esm bound conjured weapons — standard embed OK, world-model leave-in-body blocked.
+    bool IsBoundConjuredWeapon(const RE::TESObjectWEAP* weap)
+    {
+        if (!weap) {
+            return false;
+        }
+
+        switch (weap->GetFormID() & 0xFFFFFFu) {
+            case 0x00058f5e: // Bound Battleaxe
+            case 0x000424f7: // Bound Mystic Battleaxe
+            case 0x00058f5f: // Bound Sword
+            case 0x000424f9: // Bound Mystic Sword
+            case 0x000ba30e: // Alternative Bound Sword
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool CanLeaveEquippedWeaponInBody(const RE::TESObjectWEAP* weap)
+    {
+        return weap && !IsBoundConjuredWeapon(weap);
+    }
+
     // ---- math helpers -------------------------------------------------------
 
     float Dot(const RE::NiPoint3& a, const RE::NiPoint3& b)
@@ -522,6 +547,249 @@ namespace
         return true;
     }
 
+    bool GetWeaponLinearVelocitySkyrim(bool isLeft, RE::NiPoint3& outVel)
+    {
+        if (!g_higgsInterface) {
+            return false;
+        }
+
+        auto* obj = g_higgsInterface->GetWeaponRigidBody(isLeft);
+        auto* rb = obj ? netimmerse_cast<RE::bhkRigidBody*>(obj) : nullptr;
+        if (!rb) {
+            return false;
+        }
+
+        auto* hkRb = rb->GetRigidBody();
+        if (!hkRb) {
+            return false;
+        }
+
+        auto* entity = static_cast<RE::hkpEntity*>(hkRb);
+        auto* motion = static_cast<RE::hkpMotion*>(&entity->motion);
+        const float* v = reinterpret_cast<const float*>(&motion->linearVelocity.quad);
+        outVel = { v[0] * kHavokToSkyrim, v[1] * kHavokToSkyrim, v[2] * kHavokToSkyrim };
+        return true;
+    }
+
+    RE::NiPoint3 GetPlayerHorizontalRight()
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return { 1.0f, 0.0f, 0.0f };
+        }
+
+        auto* root = player->Get3D();
+        if (!root) {
+            return { 1.0f, 0.0f, 0.0f };
+        }
+
+        RE::NiPoint3 right{ root->world.rotate.entry[0][0], root->world.rotate.entry[1][0],
+                          root->world.rotate.entry[2][0] };
+        right.z = 0.0f;
+        const float len = right.Length();
+        if (len < 1e-4f) {
+            return { 1.0f, 0.0f, 0.0f };
+        }
+        return right * (1.0f / len);
+    }
+
+    RE::NiPoint3 MatrixColumn(const RE::NiMatrix3& m, int col)
+    {
+        return { m.entry[0][col], m.entry[1][col], m.entry[2][col] };
+    }
+
+    bool TryGetWeaponBladeFlatNormal(RE::NiAVObject* weaponRoot, RE::NiPoint3& outFlatNormal)
+    {
+        if (!weaponRoot) {
+            return false;
+        }
+
+        const RE::NiMatrix3& rot = weaponRoot->world.rotate;
+        const RE::NiPoint3 axes[3] = { MatrixColumn(rot, 0), MatrixColumn(rot, 1), MatrixColumn(rot, 2) };
+        const RE::NiPoint3 grip = weaponRoot->world.translate;
+
+        int bladeAxis = 0;
+        float bladeLen = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            RE::NiPoint3 axis = axes[i];
+            const float axisLen = axis.Length();
+            if (axisLen < 1e-4f) {
+                continue;
+            }
+            axis = axis * (1.0f / axisLen);
+            const float extent = MeasureWeaponExtentAlongAxis(weaponRoot, grip, axis);
+            if (extent > bladeLen) {
+                bladeLen = extent;
+                bladeAxis = i;
+            }
+        }
+
+        if (bladeLen < 1e-2f) {
+            return false;
+        }
+
+        int flatAxis = (bladeAxis + 1) % 3;
+        float flatLen = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            if (i == bladeAxis) {
+                continue;
+            }
+            RE::NiPoint3 axis = axes[i];
+            const float axisLen = axis.Length();
+            if (axisLen < 1e-4f) {
+                continue;
+            }
+            axis = axis * (1.0f / axisLen);
+            const float extent = MeasureWeaponExtentAlongAxis(weaponRoot, grip, axis);
+            if (flatLen < 1e-4f || extent < flatLen) {
+                flatLen = extent;
+                flatAxis = i;
+            }
+        }
+
+        RE::NiPoint3 flatNormal = axes[flatAxis];
+        const float flatNormalLen = flatNormal.Length();
+        if (flatNormalLen < 1e-4f) {
+            return false;
+        }
+
+        outFlatNormal = flatNormal * (1.0f / flatNormalLen);
+        return true;
+    }
+
+    bool IsControllerPhysicallyFlat(bool isLeft)
+    {
+        auto* hand = GetHandNode(isLeft);
+        if (!hand) {
+            return false;
+        }
+
+        // When the controller is held paddle-flat, its local up axis is mostly horizontal in world space.
+        const RE::NiPoint3 ctrlUp = MatrixColumn(hand->world.rotate, 1);
+        return std::abs(ctrlUp.z) < 0.50f;
+    }
+
+    constexpr float kFlatSwingHorizMinSpeed = 80.0f;
+    constexpr float kFlatSwingHorizMaxVerticalFrac = 0.45f;
+    constexpr float kFlatSwingLateralDotMin = 0.55f;
+    constexpr float kFlatSwingFaceAlignMin = 0.55f;
+    constexpr float kFlatSwingLogCooldownSec = 0.35f;
+
+    struct FlatLateralSwingSample
+    {
+        bool valid = false;
+        const char* dirName = nullptr;
+        float speed = 0.0f;
+        float flatAlign = 0.0f;
+        bool controllerFlat = false;
+        const char* weaponName = "none";
+    };
+
+    struct FlatSwingDiagState
+    {
+        bool active = false;
+        std::chrono::steady_clock::time_point lastLogTime{};
+    };
+
+    FlatSwingDiagState g_flatSwingDiag[2];
+
+    FlatLateralSwingSample AnalyzeFlatLateralSwing(bool isLeft, const RE::NiPoint3& velocity,
+                                                     const RE::NiPoint3& playerRightHoriz)
+    {
+        FlatLateralSwingSample sample{};
+
+        RE::NiPoint3 horizVel{ velocity.x, velocity.y, 0.0f };
+        const float horizSpeed = horizVel.Length();
+        sample.speed = velocity.Length();
+        if (horizSpeed < kFlatSwingHorizMinSpeed ||
+            std::abs(velocity.z) > horizSpeed * kFlatSwingHorizMaxVerticalFrac) {
+            return sample;
+        }
+
+        horizVel = horizVel * (1.0f / horizSpeed);
+        const float lateralDot = Dot(horizVel, playerRightHoriz);
+        if (lateralDot >= kFlatSwingLateralDotMin) {
+            sample.dirName = "right";
+        } else if (lateralDot <= -kFlatSwingLateralDotMin) {
+            sample.dirName = "left";
+        } else {
+            return sample;
+        }
+
+        auto* weapon = GetPlayerWeaponNode(isLeft);
+        RE::NiPoint3 flatNormal{};
+        if (!TryGetWeaponBladeFlatNormal(weapon, flatNormal)) {
+            return sample;
+        }
+
+        sample.flatAlign = std::abs(Dot(flatNormal, horizVel));
+        sample.controllerFlat = IsControllerPhysicallyFlat(isLeft);
+        if (sample.flatAlign < kFlatSwingFaceAlignMin && !sample.controllerFlat) {
+            return sample;
+        }
+
+        const WeaponProfile profile = ClassifyWeapon(GetEquippedWeapon(isLeft));
+        sample.weaponName = profile.name;
+        sample.valid = true;
+        return sample;
+    }
+
+    void LogFlatLateralSwing(bool isLeft, const FlatLateralSwingSample& sample, const char* trigger)
+    {
+        IW_LOG_INFO(
+            "[bite][FLAT-SWING] trigger={}  hand={}  dir={}  speed={:.0f}  flatAlign={:.2f}  ctrlFlat={}  "
+            "weapon={}  (blade face leading — should not embed)",
+            trigger, isLeft ? "L" : "R", sample.dirName, sample.speed, sample.flatAlign,
+            sample.controllerFlat ? "Y" : "N", sample.weaponName);
+    }
+
+    void UpdateFlatSwingDiagnostics()
+    {
+        if (!g_higgsInterface) {
+            return;
+        }
+
+        const RE::NiPoint3 playerRight = GetPlayerHorizontalRight();
+        const auto now = std::chrono::steady_clock::now();
+
+        for (bool isLeft : { false, true }) {
+            const WeaponProfile profile = ClassifyWeapon(GetEquippedWeapon(isLeft));
+            if (!profile.allowed) {
+                g_flatSwingDiag[isLeft ? 1 : 0].active = false;
+                continue;
+            }
+
+            RE::NiPoint3 velocity{};
+            if (!GetWeaponLinearVelocitySkyrim(isLeft, velocity)) {
+                g_flatSwingDiag[isLeft ? 1 : 0].active = false;
+                continue;
+            }
+
+            const FlatLateralSwingSample sample = AnalyzeFlatLateralSwing(isLeft, velocity, playerRight);
+            auto& state = g_flatSwingDiag[isLeft ? 1 : 0];
+            if (!sample.valid) {
+                state.active = false;
+                continue;
+            }
+
+            if (state.active) {
+                continue;
+            }
+
+            if (state.lastLogTime.time_since_epoch().count() != 0) {
+                const float sinceLast =
+                    std::chrono::duration<float>(now - state.lastLogTime).count();
+                if (sinceLast < kFlatSwingLogCooldownSec) {
+                    continue;
+                }
+            }
+
+            LogFlatLateralSwing(isLeft, sample, "swing");
+            state.active = true;
+            state.lastLogTime = now;
+        }
+    }
+
     bool EmbedGameHandIsPhysicalLeft(bool isLeftGameHand)
     {
         return RE::BSOpenVRControllerDevice::IsLeftHandedMode() ? !isLeftGameHand : isLeftGameHand;
@@ -587,8 +855,7 @@ namespace
             if (device != OpenVRCompat::kInvalidDevice) {
                 OpenVRCompat::ControllerState state{};
                 if (OpenVRCompat::GetControllerState(vr->vrSystem, device, &state)) {
-                    const bool triggerButton =
-                        (state.ulButtonPressed & OpenVRCompat::kTriggerButtonMask) != 0;
+                    const bool triggerButton = (state.ulButtonPressed & OpenVRCompat::kTriggerButtonMask) != 0;
                     const bool triggerAxis = state.rAxis[1].x > 0.5f;
                     if (triggerButton || triggerAxis) {
                         return true;
@@ -600,17 +867,35 @@ namespace
         return IsTriggerPressedViaSkyrimInput(isLeftGameHand);
     }
 
-    bool IsWorldAxeLeaveInBodyInputPressed(bool isLeftGameHand)
+    // False Edge VR uses grip for its own weapon tracking — use trigger for world-model actions.
+    bool EmbedWorldModelFeatureEnabled()
     {
-        if (BitingAxesVR::IsFalseEdgeVRPresent()) {
-            return IsTriggerPressedOnEmbedHand(isLeftGameHand);
-        }
-        return IsGripPressedOnEmbedHand(isLeftGameHand);
+        return BitingAxesVR::embedWorldModelEnabled != 0;
     }
 
-    const char* WorldAxeLeaveInBodyInputName()
+    bool UseTriggerForWorldAxeInput()
     {
-        return BitingAxesVR::IsFalseEdgeVRPresent() ? "trigger" : "grip";
+        if (!EmbedWorldModelFeatureEnabled()) {
+            return false;
+        }
+        static const bool s_useTrigger = [] {
+            if (BitingAxesVR::IsFalseEdgeVRPresent()) {
+                IW_LOG_INFO("False Edge VR detected — world-model embed/regrab uses trigger (grip unchanged for HIGGS hold)");
+            }
+            return BitingAxesVR::IsFalseEdgeVRPresent();
+        }();
+        return s_useTrigger;
+    }
+
+    const char* WorldAxeInputButtonName()
+    {
+        return UseTriggerForWorldAxeInput() ? "trigger" : "grip";
+    }
+
+    bool IsWorldAxeInputPressedOnEmbedHand(bool isLeftGameHand)
+    {
+        return UseTriggerForWorldAxeInput() ? IsTriggerPressedOnEmbedHand(isLeftGameHand)
+                                            : IsGripPressedOnEmbedHand(isLeftGameHand);
     }
 
     // Controller vibration (the sensory stand-in for force feedback). strength ~ 0..1.
@@ -793,6 +1078,18 @@ namespace
         bool haveLastPlayerStaminaTick = false;
     };
 
+    float GetPlayerToActorDistance(RE::Actor* actor)
+    {
+        if (!actor) {
+            return -1.0f;
+        }
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return -1.0f;
+        }
+        return (player->GetPosition() - actor->GetPosition()).Length();
+    }
+
     // Axes the player released while still embedded — kept at the wound, following the victim bone.
     struct LodgedAxeInBody
     {
@@ -842,6 +1139,29 @@ namespace
     };
 
     EmbedState g_embeds[2];  // [0] = right hand, [1] = left hand
+    std::chrono::steady_clock::time_point g_embedCooldownUntil[2]{};
+
+    void MarkEmbedHandCooldown(bool isLeft)
+    {
+        if (BitingAxesVR::embedCooldownSec <= 0.0) {
+            return;
+        }
+
+        const float cooldownSec = static_cast<float>(BitingAxesVR::embedCooldownSec);
+        g_embedCooldownUntil[isLeft ? 1 : 0] =
+            std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                   std::chrono::duration<float>(cooldownSec));
+    }
+
+    bool IsEmbedHandOnCooldown(bool isLeft)
+    {
+        if (BitingAxesVR::embedCooldownSec <= 0.0) {
+            return false;
+        }
+
+        return std::chrono::steady_clock::now() < g_embedCooldownUntil[isLeft ? 1 : 0];
+    }
+
     std::vector<LodgedAxeInBody> g_lodgedAxes;
     std::vector<BleedingWoundSite> g_bleedingWounds;
     LodgedAxeExtractState g_lodgedExtract;
@@ -882,17 +1202,20 @@ namespace
         WorldAxeTrackPhase phase = WorldAxeTrackPhase::ActiveEmbed;
         std::chrono::steady_clock::time_point spawnedAt{};
         bool vanishLogged = false;
+        bool earlyVanishWarned = false;
     };
 
     std::vector<TrackedWorldAxe> g_trackedWorldAxes;
     std::chrono::steady_clock::time_point g_lastWorldAxeAuditTime{};
 
     constexpr float kWorldAxeVanishAuditIntervalSec = 0.25f;
+    constexpr float kWorldAxeVanishSpawnGraceSec = 0.50f;
 
     struct WorldAxeWhereabouts
     {
         bool inActiveEmbed = false;
         bool inLodgedList = false;
+        bool staleModState = false;
         bool heldByHiggsLeft = false;
         bool heldByHiggsRight = false;
         bool inPlayerInventory = false;
@@ -956,7 +1279,7 @@ namespace
         return false;
     }
 
-    WorldAxeWhereabouts QueryWorldAxeWhereabouts(RE::FormID refId, RE::FormID baseFormId)
+    WorldAxeWhereabouts QueryWorldAxeWhereabouts(RE::FormID refId, RE::FormID baseFormId, RE::Actor* knownVictim)
     {
         WorldAxeWhereabouts where{};
 
@@ -980,6 +1303,9 @@ namespace
         for (const auto& lodged : g_lodgedAxes) {
             if (lodged.axeRefr && lodged.axeRefr->GetFormID() == refId) {
                 where.inLodgedList = true;
+                if (!knownVictim && lodged.victimActor) {
+                    knownVictim = lodged.victimActor.get();
+                }
                 break;
             }
         }
@@ -1010,42 +1336,62 @@ namespace
         }
 
         if (where.resolvedRef) {
-            if (auto* victim = FindTrackedWorldAxe(refId) ? FindTrackedWorldAxe(refId)->victimHandle.get().get()
-                                                          : nullptr) {
-                where.embeddedOnVictim = IsAxeEmbeddedOnVictim(where.resolvedRef, victim);
-            } else {
+            if (!knownVictim) {
                 for (const auto& lodged : g_lodgedAxes) {
                     if (lodged.axeRefr && lodged.axeRefr->GetFormID() == refId && lodged.victimActor) {
-                        where.embeddedOnVictim = IsAxeEmbeddedOnVictim(where.resolvedRef, lodged.victimActor.get());
+                        knownVictim = lodged.victimActor.get();
                         break;
                     }
                 }
-                if (!where.embeddedOnVictim) {
-                    for (const auto& e : g_embeds) {
-                        if (e.useWorldAxe && e.worldAxeRefr && e.worldAxeRefr->GetFormID() == refId &&
-                            e.victimActor) {
-                            where.embeddedOnVictim =
-                                IsAxeEmbeddedOnVictim(where.resolvedRef, e.victimActor.get());
-                            break;
-                        }
+            }
+            if (!knownVictim) {
+                for (const auto& e : g_embeds) {
+                    if (e.useWorldAxe && e.worldAxeRefr && e.worldAxeRefr->GetFormID() == refId && e.victimActor) {
+                        knownVictim = e.victimActor.get();
+                        break;
                     }
                 }
             }
+            if (knownVictim) {
+                where.embeddedOnVictim = IsAxeEmbeddedOnVictim(where.resolvedRef, knownVictim);
+            }
         }
+
+        where.staleModState =
+            (where.inActiveEmbed || where.inLodgedList) && !where.embeddedOnVictim && !where.heldByHiggsLeft &&
+            !where.heldByHiggsRight && !where.inPlayerInventory && !where.equippedLeft && !where.equippedRight;
 
         return where;
     }
 
+    bool IsWorldAxePhysicallyAccountedFor(const WorldAxeWhereabouts& where)
+    {
+        return where.heldByHiggsLeft || where.heldByHiggsRight || where.inPlayerInventory || where.equippedLeft ||
+               where.equippedRight || where.embeddedOnVictim;
+    }
+
     bool IsWorldAxeVanished(const WorldAxeWhereabouts& where)
     {
-        const bool accountedFor = where.inActiveEmbed || where.inLodgedList || where.heldByHiggsLeft ||
-                                  where.heldByHiggsRight || where.inPlayerInventory || where.equippedLeft ||
-                                  where.equippedRight || where.embeddedOnVictim;
-        if (accountedFor) {
-            return false;
-        }
+        // Lost = not on victim skeleton, not held, not in player inventory/equipment.
+        // Do not trust inLodgedList/inActiveEmbed alone (stale mod state during race conditions).
+        return !IsWorldAxePhysicallyAccountedFor(where);
+    }
 
-        return !where.refExists || where.refDisabled || !where.has3D;
+    const char* DescribeWorldAxeVanishKind(const WorldAxeWhereabouts& where)
+    {
+        if (!where.refExists) {
+            return "ref_deleted";
+        }
+        if (where.refDisabled) {
+            return "ref_disabled";
+        }
+        if (!where.has3D) {
+            return "missing_3d";
+        }
+        if (where.staleModState) {
+            return "stale_mod_state";
+        }
+        return "unlinked";
     }
 
     void LogWorldAxeVanish(const TrackedWorldAxe& tracked, const char* trigger, const WorldAxeWhereabouts& where)
@@ -1053,21 +1399,29 @@ namespace
         const float ageSec =
             std::chrono::duration<float>(std::chrono::steady_clock::now() - tracked.spawnedAt).count();
         const char* phaseName = tracked.phase == WorldAxeTrackPhase::ActiveEmbed ? "active_embed" : "lodged";
+        const char* kind = DescribeWorldAxeVanishKind(where);
 
         IW_LOG_ERROR(
-            "[bite][VANISH] world axe disappeared  trigger={}  phase={}  age={:.2f}s  ref=0x{:08X}  base=0x{:08X}  "
+            "[bite][VANISH] world axe LOST  kind={}  trigger={}  phase={}  age={:.2f}s  ref=0x{:08X}  base=0x{:08X}  "
             "weapon='{}'  victim='{}'  bone='{}'  hand={}",
-            trigger, phaseName, ageSec, tracked.refId, tracked.baseFormId, tracked.weaponName, tracked.victimName,
-            tracked.boneName, tracked.isLeft ? "L" : "R");
+            kind, trigger, phaseName, ageSec, tracked.refId, tracked.baseFormId, tracked.weaponName,
+            tracked.victimName, tracked.boneName, tracked.isLeft ? "L" : "R");
         IW_LOG_ERROR(
-            "[bite][VANISH] whereabouts  activeEmbed={}  lodged={}  higgsL={}  higgsR={}  invCount={}  eqL={}  eqR={}  "
-            "refExists={}  disabled={}  has3D={}  embeddedOnVictim={}",
-            where.inActiveEmbed, where.inLodgedList, where.heldByHiggsLeft, where.heldByHiggsRight,
-            where.inventoryCount, where.equippedLeft, where.equippedRight, where.refExists, where.refDisabled,
-            where.has3D, where.embeddedOnVictim);
+            "[bite][VANISH] expected=embedded_on_victim|player_inv|equipped|higgs  actual  embeddedOnVictim={}  "
+            "invCount={}  eqL={}  eqR={}  higgsL={}  higgsR={}",
+            where.embeddedOnVictim, where.inventoryCount, where.equippedLeft, where.equippedRight,
+            where.heldByHiggsLeft, where.heldByHiggsRight);
+        IW_LOG_ERROR(
+            "[bite][VANISH] modState  inActiveEmbed={}  inLodgedList={}  staleModState={}  refExists={}  "
+            "disabled={}  has3D={}",
+            where.inActiveEmbed, where.inLodgedList, where.staleModState, where.refExists, where.refDisabled,
+            where.has3D);
         if (!where.parentChain.empty()) {
             IW_LOG_ERROR("[bite][VANISH] parentChain={}", where.parentChain);
         }
+        SKSE::log::error("[bite][VANISH] {} ref=0x{:08X} victim='{}' trigger={} embedded={} inv={}",
+                         kind, tracked.refId, tracked.victimName, trigger, where.embeddedOnVictim,
+                         where.inventoryCount);
     }
 
     void RegisterTrackedWorldAxe(RE::TESObjectREFR* refr, RE::TESObjectWEAP* weapForm, RE::Actor* victim,
@@ -1126,13 +1480,37 @@ namespace
             return;
         }
 
-        const WorldAxeWhereabouts where = QueryWorldAxeWhereabouts(tracked.refId, tracked.baseFormId);
+        RE::Actor* victim = tracked.victimHandle.get().get();
+        const WorldAxeWhereabouts where =
+            QueryWorldAxeWhereabouts(tracked.refId, tracked.baseFormId, victim);
         if (!IsWorldAxeVanished(where)) {
+            return;
+        }
+
+        const float ageSec =
+            std::chrono::duration<float>(std::chrono::steady_clock::now() - tracked.spawnedAt).count();
+        if (ageSec < kWorldAxeVanishSpawnGraceSec) {
+            if (!tracked.earlyVanishWarned) {
+                const char* kind = DescribeWorldAxeVanishKind(where);
+                IW_LOG_WARN(
+                    "[bite][VANISH][early] world axe lost within {:.2f}s of spawn  kind={}  trigger={}  "
+                    "ref=0x{:08X}  has3D={}  embedded={}  higgsL={}  higgsR={}  inv={}",
+                    ageSec, kind, trigger, tracked.refId, where.has3D, where.embeddedOnVictim,
+                    where.heldByHiggsLeft, where.heldByHiggsRight, where.inventoryCount);
+                tracked.earlyVanishWarned = true;
+            }
             return;
         }
 
         LogWorldAxeVanish(tracked, trigger, where);
         tracked.vanishLogged = true;
+    }
+
+    void ReportWorldAxeVanishForRef(RE::FormID refId, const char* trigger)
+    {
+        if (auto* tracked = FindTrackedWorldAxe(refId)) {
+            ReportWorldAxeVanishIfNeeded(*tracked, trigger);
+        }
     }
 
     void AuditTrackedWorldAxes()
@@ -1175,6 +1553,9 @@ namespace
 
     bool CanAffordLodgedNpcHold()
     {
+        if (BitingAxesVR::lodgedHoldStaminaDrainEnabled == 0) {
+            return true;
+        }
         return GetPlayerStamina() >= static_cast<float>(BitingAxesVR::lodgedHoldStaminaMin);
     }
 
@@ -1219,6 +1600,7 @@ namespace
 
     bool VictimHasLodgedAxe(RE::Actor* victim);
     bool IsLivingVictim(RE::Actor* actor);
+    bool ShouldApplyLodgedNpcHold(RE::Actor* victim);
     void InitEmbedVictimEffects(EmbedState& e);
     void InitLodgedAxeVictimEffects(LodgedAxeInBody& lodged);
     void ReleaseWorldAxeEmbedVictimRestrictions(EmbedState& e);
@@ -1226,6 +1608,8 @@ namespace
     void EndLodgedNpcHold(bool isLeft);
     void UpdateLodgedNpcHold();
     void ReleaseHeldLodgedVictim(LodgedNpcHoldState& hold, RE::Actor* actor);
+    void FillEmbedApiSnapshot(const EmbedState& e, BitingAxesAPI::EmbedSnapshot& out);
+    void FillLodgedApiSnapshot(const LodgedAxeInBody& lodged, bool isLeft, BitingAxesAPI::EmbedSnapshot& out);
 
     EmbedState& EmbedFor(bool isLeft)
     {
@@ -1395,6 +1779,9 @@ namespace
         if (!e.pendingWorldAxeGrab || !e.worldAxeRefr || !g_higgsInterface) {
             return;
         }
+        if (UseTriggerForWorldAxeInput() && !IsTriggerPressedOnEmbedHand(e.isLeft)) {
+            return;
+        }
         if (!e.worldAxeRefr->Get3D()) {
             if (auto* tracked = FindTrackedWorldAxe(e.worldAxeRefr->GetFormID())) {
                 ReportWorldAxeVanishIfNeeded(*tracked, "pending_grab_missing_3d");
@@ -1404,6 +1791,9 @@ namespace
             }
             return;
         }
+        if (e.victimActor && !IsAxeEmbeddedOnVictim(e.worldAxeRefr.get(), e.victimActor.get())) {
+            return;
+        }
         if (!g_higgsInterface->CanGrabObject(e.isLeft)) {
             return;
         }
@@ -1411,7 +1801,8 @@ namespace
         g_higgsInterface->SetGrabTransform(e.isLeft, e.handGrabTransform);
         g_higgsInterface->GrabObject(e.worldAxeRefr.get(), e.isLeft);
         e.pendingWorldAxeGrab = false;
-        IW_LOG_INFO("[bite] HIGGS auto-grabbed world axe on {} hand", e.isLeft ? "L" : "R");
+        IW_LOG_INFO("[bite] HIGGS auto-grabbed world axe on {} hand ({})",
+                    e.isLeft ? "L" : "R", WorldAxeInputButtonName());
     }
 
     bool BeginWorldAxeEmbed(EmbedState& e, RE::Actor* victim, RE::NiAVObject* weapon, RE::NiAVObject* handNode,
@@ -1423,7 +1814,7 @@ namespace
 
         auto* player = RE::PlayerCharacter::GetSingleton();
         auto* weapForm = const_cast<RE::TESObjectWEAP*>(GetEquippedWeapon(e.isLeft));
-        if (!player || !weapForm) {
+        if (!player || !weapForm || IsBoundConjuredWeapon(weapForm)) {
             return false;
         }
 
@@ -1467,6 +1858,17 @@ namespace
         player->RemoveItem(weapForm, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
         refr->SetMotionType(RE::hkpMotion::MotionType::kKeyframed, true);
 
+        if (auto* bone = e.boneNode.get()) {
+            SyncWorldAxeToBone(refr, bone, e.entryLocalToBone, e.axisLocalToBone, e.depth, e.weaponRotLocalToBone,
+                               e.weaponWorldScale, false);
+            if (victim && !IsAxeEmbeddedOnVictim(refr, victim)) {
+                IW_LOG_WARN("[bite][worldAxe] spawn sync did not parent ref to victim skeleton  ref=0x{:08X}",
+                            refr->GetFormID());
+            }
+        } else {
+            IW_LOG_WARN("[bite][worldAxe] spawn without bone node — ref may float until next sync");
+        }
+
         e.worldAxeRefr = RE::NiPointer<RE::TESObjectREFR>(refr);
         e.useWorldAxe = true;
         e.pendingWorldAxeGrab = true;
@@ -1502,22 +1904,29 @@ namespace
         }
         e.haveDesired = false;
         e.npcEmbedEligible = false;
+        e.pullBaselineReady = false;
+        e.haveLastBonePos = false;
+        e.startTime = std::chrono::steady_clock::now();
         ReleaseWorldAxeEmbedVictimRestrictions(e);
         IW_LOG_INFO("[bite] {} pressed on {} hand -> world axe lodged in '{}'",
-                    WorldAxeLeaveInBodyInputName(), e.isLeft ? "L" : "R", victim->GetDisplayFullName());
+                    WorldAxeInputButtonName(), e.isLeft ? "L" : "R", victim->GetDisplayFullName());
+        BitingAxesAPI::EmbedSnapshot snapshot{};
+        FillEmbedApiSnapshot(e, snapshot);
+        BitingAxesAPI::NotifyWorldAxeEmbed(snapshot);
         return true;
     }
 
     void ScheduleWorldAxeTransition(EmbedState& e)
     {
-        if (e.pendingWorldAxeTransition || e.useWorldAxe || !e.npcEmbedEligible) {
+        if (!EmbedWorldModelFeatureEnabled() || e.pendingWorldAxeTransition || e.useWorldAxe ||
+            !e.npcEmbedEligible) {
             return;
         }
 
         e.pendingWorldAxeTransition = true;
         const bool handIsLeft = e.isLeft;
         IW_LOG_INFO("[bite] {} pressed on {} hand during NPC embed — spawning world axe",
-                    WorldAxeLeaveInBodyInputName(), handIsLeft ? "L" : "R");
+                    WorldAxeInputButtonName(), handIsLeft ? "L" : "R");
 
         SKSE::GetTaskInterface()->AddTask([handIsLeft]() {
             EmbedState& embed = EmbedFor(handIsLeft);
@@ -1536,11 +1945,12 @@ namespace
 
     void UpdateGripWorldAxeTransition(EmbedState& e)
     {
-        if (!e.npcEmbedEligible || e.useWorldAxe || e.pendingWorldAxeTransition) {
+        if (!EmbedWorldModelFeatureEnabled() || !e.npcEmbedEligible || e.useWorldAxe ||
+            e.pendingWorldAxeTransition) {
             return;
         }
 
-        const bool inputDown = IsWorldAxeLeaveInBodyInputPressed(e.isLeft);
+        const bool inputDown = IsWorldAxeInputPressedOnEmbedHand(e.isLeft);
         if (inputDown && !e.gripWasDown) {
             ScheduleWorldAxeTransition(e);
         }
@@ -1569,6 +1979,12 @@ namespace
             SyncWorldAxeToBone(lodged.axeRefr.get(), lodged.boneNode.get(), lodged.entryLocalToBone,
                                lodged.axisLocalToBone, lodged.depth, lodged.weaponRotLocalToBone,
                                lodged.weaponWorldScale, true);
+
+            if (lodged.axeRefr && lodged.victimActor &&
+                !IsAxeEmbeddedOnVictim(lodged.axeRefr.get(), lodged.victimActor.get())) {
+                ReportWorldAxeVanishForRef(lodged.axeRefr->GetFormID(), "lodged_not_on_victim_skeleton");
+            }
+
             ++it;
         }
     }
@@ -1582,6 +1998,10 @@ namespace
             }
             SyncWorldAxeToBone(e.worldAxeRefr.get(), e.boneNode.get(), e.entryLocalToBone, e.axisLocalToBone,
                                e.depth, e.weaponRotLocalToBone, e.weaponWorldScale, false);
+
+            if (e.victimActor && !IsAxeEmbeddedOnVictim(e.worldAxeRefr.get(), e.victimActor.get())) {
+                ReportWorldAxeVanishForRef(e.worldAxeRefr->GetFormID(), "active_embed_not_on_victim_skeleton");
+            }
 
             // HIGGS may drive a separate grabbed body; keep it aligned with the bone-locked pose.
             if (g_higgsInterface && g_higgsInterface->IsHoldingObject(e.isLeft)) {
@@ -2023,6 +2443,10 @@ namespace
         BeginPostEmbedBleeding(lodged);
         Haptic(isLeft, static_cast<float>(BitingAxesVR::hapticExtract));
 
+        BitingAxesAPI::EmbedSnapshot extractSnapshot{};
+        FillLodgedApiSnapshot(lodged, isLeft, extractSnapshot);
+        extractSnapshot.equippedWeaponFormId = weapon->GetFormID();
+
         const RE::FormID removeRefId = lodged.axeRefr->GetFormID();
         UntrackWorldAxe(removeRefId, "extracted");
 
@@ -2040,10 +2464,11 @@ namespace
             CancelLodgedExtract();
         }
 
-        SKSE::GetTaskInterface()->AddTask([weapId = weapon->GetFormID(), isLeft]() {
+        SKSE::GetTaskInterface()->AddTask([extractSnapshot, weapId = weapon->GetFormID(), isLeft]() {
             if (auto* weap = RE::TESForm::LookupByID<RE::TESObjectWEAP>(weapId)) {
                 ReturnExtractedAxeToPlayer(weap, isLeft);
             }
+            BitingAxesAPI::NotifyWeaponExtractedFromBody(extractSnapshot);
         });
 
         const char* victimName =
@@ -2083,7 +2508,7 @@ namespace
             return;
         }
 
-        if (VictimHasLodgedAxe(victim) && IsLivingVictim(victim) && CanAffordLodgedNpcHold()) {
+        if (ShouldApplyLodgedNpcHold(victim)) {
             BeginLodgedNpcHold(isLeft, victim);
         }
 
@@ -2752,6 +3177,11 @@ namespace
         return actor && !actor->IsDead();
     }
 
+    bool ShouldApplyLodgedNpcHold(RE::Actor* victim)
+    {
+        return victim && IsLivingVictim(victim) && victim->IsInCombat() && CanAffordLodgedNpcHold();
+    }
+
     bool IsDeadOrIncapacitatedVictim(RE::Actor* actor)
     {
         if (!actor) {
@@ -2951,6 +3381,51 @@ namespace
         return false;
     }
 
+    BitingAxesAPI::EmbedBodyRegion ToApiBodyRegion(EmbedBodyRegion region)
+    {
+        return static_cast<BitingAxesAPI::EmbedBodyRegion>(static_cast<std::uint8_t>(region));
+    }
+
+    void FillEmbedApiSnapshot(const EmbedState& e, BitingAxesAPI::EmbedSnapshot& out)
+    {
+        out = {};
+        out.active = e.active;
+        out.isLeft = e.isLeft;
+        out.useWorldAxe = e.useWorldAxe;
+        out.npcEmbedEligible = e.npcEmbedEligible;
+        out.pendingWorldAxeGrab = e.pendingWorldAxeGrab;
+        if (e.victimActor) {
+            out.victimHandle = e.victimActor->CreateRefHandle();
+        }
+        if (const auto* weap = GetEquippedWeapon(e.isLeft)) {
+            out.equippedWeaponFormId = weap->GetFormID();
+        }
+        if (e.worldAxeRefr) {
+            out.worldAxeRefFormId = e.worldAxeRefr->GetFormID();
+        }
+        out.bodyRegion = ToApiBodyRegion(e.embedBodyRegion);
+        out.embedBoneName = e.embedBoneName;
+    }
+
+    void FillLodgedApiSnapshot(const LodgedAxeInBody& lodged, bool isLeft, BitingAxesAPI::EmbedSnapshot& out)
+    {
+        out = {};
+        out.active = false;
+        out.isLeft = isLeft;
+        out.useWorldAxe = false;
+        if (lodged.victimActor) {
+            out.victimHandle = lodged.victimActor->CreateRefHandle();
+        }
+        if (const auto* weap = GetEquippedWeapon(isLeft)) {
+            out.equippedWeaponFormId = weap->GetFormID();
+        }
+        if (lodged.axeRefr) {
+            out.worldAxeRefFormId = lodged.axeRefr->GetFormID();
+        }
+        out.bodyRegion = ToApiBodyRegion(lodged.embedBodyRegion);
+        out.embedBoneName = lodged.embedBoneName;
+    }
+
     void ImmobilizeHeldLodgedVictim(LodgedNpcHoldState& hold, RE::Actor* actor)
     {
         if (!actor) {
@@ -3041,7 +3516,7 @@ namespace
 
     void BeginLodgedNpcHold(bool isLeft, RE::Actor* victim)
     {
-        if (!victim || !IsLivingVictim(victim) || !CanAffordLodgedNpcHold()) {
+        if (!ShouldApplyLodgedNpcHold(victim)) {
             return;
         }
 
@@ -3053,7 +3528,7 @@ namespace
             g_lodgedNpcHold.haveLastStaminaTick = false;
             g_lodgedNpcHold.staminaExhausted = false;
             ImmobilizeHeldLodgedVictim(g_lodgedNpcHold, victim);
-            IW_LOG_INFO("[bite] holding '{}' with lodged axe — movement locked",
+            IW_LOG_INFO("[bite] holding '{}' with lodged axe — movement locked (in combat)",
                         victim->GetDisplayFullName());
         }
     }
@@ -3124,7 +3599,15 @@ namespace
             return;
         }
 
-        if (!CanAffordLodgedNpcHold() || g_lodgedNpcHold.staminaExhausted) {
+        if (!victim->IsInCombat()) {
+            if (g_lodgedNpcHold.immobilized) {
+                ReleaseHeldLodgedVictim(g_lodgedNpcHold, victim);
+            }
+            return;
+        }
+
+        if (BitingAxesVR::lodgedHoldStaminaDrainEnabled != 0 &&
+            (!CanAffordLodgedNpcHold() || g_lodgedNpcHold.staminaExhausted)) {
             if (g_lodgedNpcHold.immobilized) {
                 ReleaseHeldLodgedVictim(g_lodgedNpcHold, victim);
             }
@@ -3133,6 +3616,11 @@ namespace
         }
 
         MaintainHeldLodgedVictim(g_lodgedNpcHold, victim);
+
+        if (BitingAxesVR::lodgedHoldStaminaDrainEnabled == 0 ||
+            BitingAxesVR::lodgedHoldStaminaDrainPerSec <= 0.0) {
+            return;
+        }
 
         const auto now = std::chrono::steady_clock::now();
         float dt = 0.016f;
@@ -3844,6 +4332,7 @@ namespace
 
     void LeaveEmbedWithoutDislodge(EmbedState& e)
     {
+        const bool wasActive = e.active;
         EndVictimDistress(e);
         e.active = false;
         e.haveDesired = false;
@@ -3854,6 +4343,44 @@ namespace
         e.weaponNode.reset();
         e.handNode.reset();
         e.fpHandNode.reset();
+        if (wasActive) {
+            MarkEmbedHandCooldown(e.isLeft);
+        }
+    }
+
+    bool LodgeActiveWorldAxeFromEmbed(EmbedState& e, bool isLeft, const char* trackReason, bool notifyApi)
+    {
+        if (!e.active || !e.useWorldAxe || !e.worldAxeRefr || !e.boneNode) {
+            return false;
+        }
+
+        LodgedAxeInBody lodged{};
+        lodged.axeRefr = e.worldAxeRefr;
+        lodged.boneNode = e.boneNode;
+        lodged.victimActor = e.victimActor;
+        lodged.embedBoneName = e.embedBoneName;
+        lodged.embedBodyRegion = e.embedBodyRegion;
+        lodged.entryLocalToBone = e.entryLocalToBone;
+        lodged.axisLocalToBone = e.axisLocalToBone;
+        lodged.weaponRotLocalToBone = e.weaponRotLocalToBone;
+        lodged.depth = e.depth;
+        lodged.weaponWorldScale = e.weaponWorldScale;
+        lodged.axeRefr->SetMotionType(RE::hkpMotion::MotionType::kFixed, true);
+        if (e.victimActor) {
+            InitLodgedAxeVictimEffects(lodged);
+        }
+        g_lodgedAxes.push_back(lodged);
+        SetTrackedWorldAxePhase(lodged.axeRefr->GetFormID(), WorldAxeTrackPhase::Lodged, trackReason);
+
+        LogEmbedBodyLocation("lodged", lodged.embedBodyRegion, lodged.embedBoneName, e.victimActor.get(),
+                             e.profile.name, isLeft);
+        if (notifyApi) {
+            BitingAxesAPI::EmbedSnapshot snapshot{};
+            FillLodgedApiSnapshot(lodged, isLeft, snapshot);
+            BitingAxesAPI::NotifyWeaponLodgedInBody(snapshot);
+        }
+        LeaveEmbedWithoutDislodge(e);
+        return true;
     }
 
     void OnHiggsDropped(bool isLeft, RE::TESObjectREFR* droppedRefr)
@@ -3877,30 +4404,11 @@ namespace
             return;
         }
 
-        LodgedAxeInBody lodged{};
-        lodged.axeRefr = e.worldAxeRefr;
-        lodged.boneNode = e.boneNode;
-        lodged.victimActor = e.victimActor;
-        lodged.embedBoneName = e.embedBoneName;
-        lodged.embedBodyRegion = e.embedBodyRegion;
-        lodged.entryLocalToBone = e.entryLocalToBone;
-        lodged.axisLocalToBone = e.axisLocalToBone;
-        lodged.weaponRotLocalToBone = e.weaponRotLocalToBone;
-        lodged.depth = e.depth;
-        lodged.weaponWorldScale = e.weaponWorldScale;
-        lodged.axeRefr->SetMotionType(RE::hkpMotion::MotionType::kFixed, true);
-        if (e.victimActor) {
-            InitLodgedAxeVictimEffects(lodged);
-        }
-        g_lodgedAxes.push_back(lodged);
-        SetTrackedWorldAxePhase(lodged.axeRefr->GetFormID(), WorldAxeTrackPhase::Lodged, "grip_released");
-
         const char* victimName =
             e.victimActor ? e.victimActor->GetDisplayFullName() : "<unknown>";
-        LogEmbedBodyLocation("lodged", lodged.embedBodyRegion, lodged.embedBoneName, e.victimActor.get(),
-                             e.profile.name, isLeft);
-        LeaveEmbedWithoutDislodge(e);
-        IW_LOG_INFO("[bite] player released grip; axe left embedded in '{}'", victimName);
+        if (LodgeActiveWorldAxeFromEmbed(e, isLeft, "grip_released", true)) {
+            IW_LOG_INFO("[bite] player released grip; axe left embedded in '{}'", victimName);
+        }
     }
 
     void StartEmbed(const PlanckAPI::PlanckHitData& hit, RE::Actor* victim)
@@ -3909,28 +4417,45 @@ namespace
         if (e.active) {
             return;  // this hand's axe is already lodged
         }
+        if (IsEmbedHandOnCooldown(hit.isLeft)) {
+            return;
+        }
         const WeaponProfile profile = ClassifyWeapon(GetEquippedWeapon(hit.isLeft));
         if (!profile.allowed) {
             return;
         }
-        // Only bite into the body: hits registered on the victim's held weapon or shield
-        // node must not embed (the log showed bites into "Weapon (...)" nodes). Arms and
-        // hands are also excluded -- too thin to hold a wedged axe (clavicle/shoulder is
-        // fine and stays biteable).
+
+        const FlatLateralSwingSample flatSample =
+            AnalyzeFlatLateralSwing(hit.isLeft, hit.velocity, GetPlayerHorizontalRight());
+        if (flatSample.valid) {
+            LogFlatLateralSwing(hit.isLeft, flatSample, "embed-rejected");
+            return;
+        }
+
+        // Victim weapon/shield nodes and hands/fingers never embed. Upper arm/forearm only when enabled.
         if (!hit.nodeName.empty()) {
             std::string_view name{ hit.nodeName.c_str() };
-            static constexpr const char* kExcludedBoneMarkers[] = {
+            static constexpr const char* kAlwaysExcludedBoneMarkers[] = {
                 "Weapon", "WEAPON", "Shield", "SHIELD",
-                "UpperArm",  // NPC L/R UpperArm [LUArm]/[RUArm] + twist bones
-                "Forearm",   // NPC L/R Forearm [LLArm]/[RLArm] + twist bones
-                "[LUArm]", "[RUArm]", "[LLArm]", "[RLArm]",
-                "Hand",      // NPC L/R Hand [LHnd]/[RHnd]
-                "[LHnd]", "[RHnd]",
+                "Hand", "[LHnd]", "[RHnd]",
                 "Finger", "Thumb",
             };
-            for (const char* marker : kExcludedBoneMarkers) {
+            for (const char* marker : kAlwaysExcludedBoneMarkers) {
                 if (name.find(marker) != std::string_view::npos) {
                     return;
+                }
+            }
+
+            if (BitingAxesVR::embedArmsAndHandsEnabled == 0) {
+                static constexpr const char* kArmExcludedBoneMarkers[] = {
+                    "UpperArm",  // NPC L/R UpperArm [LUArm]/[RUArm] + twist bones
+                    "Forearm",   // NPC L/R Forearm [LLArm]/[RLArm] + twist bones
+                    "[LUArm]", "[RUArm]", "[LLArm]", "[RLArm]",
+                };
+                for (const char* marker : kArmExcludedBoneMarkers) {
+                    if (name.find(marker) != std::string_view::npos) {
+                        return;
+                    }
                 }
             }
         }
@@ -4091,13 +4616,13 @@ namespace
             if (IsLivingVictim(victim)) {
                 InitEmbedVictimEffects(e);
             }
-            // Grip -> world-model axe only on living NPCs; corpses use standard pull-out embed.
-            if (IsLivingVictim(victim)) {
+            // Grip/trigger -> world-model axe only on living NPCs when enabled; corpses use standard pull-out.
+            if (EmbedWorldModelFeatureEnabled() && IsLivingVictim(victim) &&
+                CanLeaveEquippedWeaponInBody(GetEquippedWeapon(hit.isLeft))) {
                 e.npcEmbedEligible = true;
-                e.gripWasDown = IsWorldAxeLeaveInBodyInputPressed(hit.isLeft);
-                IW_LOG_INFO("[bite] NPC embed: press {} on {} hand to leave axe in body (FalseEdgeVR={})",
-                            WorldAxeLeaveInBodyInputName(), hit.isLeft ? "L" : "R",
-                            BitingAxesVR::IsFalseEdgeVRPresent() ? "Y" : "N");
+                e.gripWasDown = IsWorldAxeInputPressedOnEmbedHand(hit.isLeft);
+                IW_LOG_INFO("[bite] NPC embed: press {} on {} hand to leave axe in body",
+                            WorldAxeInputButtonName(), hit.isLeft ? "L" : "R");
             }
         }
 
@@ -4113,12 +4638,21 @@ namespace
                     hit.isLeft ? "L" : "R", profile.name, EmbedBodyRegionName(e.embedBodyRegion),
                     hit.nodeName.empty() ? "<unnamed>" : hit.nodeName.c_str(),
                     e.haftLen, chopSpeed, biteFrac, e.useWorldAxe ? "  worldAxe=Y" : "");
+        BitingAxesAPI::EmbedSnapshot snapshot{};
+        FillEmbedApiSnapshot(e, snapshot);
+        BitingAxesAPI::NotifyEmbedStarted(snapshot);
     }
 
     // Clear one hand's embed state and restore its weapon collision. Silent variant for
     // save-load / new-game resets, where the old scene is gone and a buzz would be wrong.
     void ResetEmbed(EmbedState& e)
     {
+        BitingAxesAPI::EmbedSnapshot endSnapshot{};
+        const bool wasActive = e.active;
+        if (wasActive) {
+            FillEmbedApiSnapshot(e, endSnapshot);
+        }
+
         EndVictimDistress(e);
         if (e.active && g_higgsInterface && !e.useWorldAxe) {
             g_higgsInterface->EnableWeaponCollision(e.isLeft);
@@ -4135,10 +4669,25 @@ namespace
         e.weaponNode.reset();
         e.handNode.reset();
         e.fpHandNode.reset();
+
+        if (wasActive) {
+            endSnapshot.active = false;
+            BitingAxesAPI::NotifyEmbedEnded(endSnapshot);
+            MarkEmbedHandCooldown(e.isLeft);
+        }
     }
 
     void ReleaseEmbed(EmbedState& e, const char* reason)
     {
+        const bool intentionalWorldAxePull =
+            e.useWorldAxe && g_higgsInterface && g_higgsInterface->IsHoldingObject(e.isLeft) &&
+            std::strcmp(reason, "pulled back") == 0;
+        if (e.useWorldAxe && !intentionalWorldAxePull &&
+            LodgeActiveWorldAxeFromEmbed(e, e.isLeft, reason, false)) {
+            IW_LOG_INFO("[bite] world axe kept lodged on victim instead of orphaning ({})", reason);
+            return;
+        }
+
         if (e.useWorldAxe) {
             if (e.worldAxeRefr) {
                 UntrackWorldAxe(e.worldAxeRefr->GetFormID(), reason);
@@ -4215,10 +4764,13 @@ namespace
             }
 
             if (auto* tracked = FindTrackedWorldAxe(e.worldAxeRefr->GetFormID())) {
-                const WorldAxeWhereabouts where =
-                    QueryWorldAxeWhereabouts(tracked->refId, tracked->baseFormId);
+                const WorldAxeWhereabouts where = QueryWorldAxeWhereabouts(
+                    tracked->refId, tracked->baseFormId, e.victimActor.get());
                 if (!where.has3D) {
                     ReportWorldAxeVanishIfNeeded(*tracked, "active_embed_missing_3d");
+                } else if (e.victimActor &&
+                           !IsAxeEmbeddedOnVictim(e.worldAxeRefr.get(), e.victimActor.get())) {
+                    ReportWorldAxeVanishIfNeeded(*tracked, "active_embed_detached");
                 }
             }
         } else {
@@ -4236,11 +4788,28 @@ namespace
                 ReleaseEmbed(e, "stamina exhausted");
                 return;
             }
+
+            if (e.victimActor) {
+                const float maxVictimDist = static_cast<float>(BitingAxesVR::biteVictimMaxDistance);
+                if (maxVictimDist > 0.0f) {
+                    const float victimDist = GetPlayerToActorDistance(e.victimActor.get());
+                    if (victimDist > maxVictimDist) {
+                        IW_LOG_INFO("[bite] victim too far ({:.1f} > {:.1f}) — releasing embed",
+                                    victimDist, maxVictimDist);
+                        ReleaseEmbed(e, "victim too far");
+                        return;
+                    }
+                }
+            }
         }
 
         const RE::NiTransform boneWorld = bone->world;
         if (!e.useWorldAxe) {
             UpdateGripWorldAxeTransition(e);
+        } else if (UseTriggerForWorldAxeInput() && g_higgsInterface && e.worldAxeRefr &&
+                   !g_higgsInterface->IsHoldingObject(e.isLeft)) {
+            // False Edge: hold trigger again to HIGGS-grab the spawned world ref if grab was missed.
+            e.pendingWorldAxeGrab = IsTriggerPressedOnEmbedHand(e.isLeft);
         }
         TryGrabWorldAxe(e);
 
@@ -4271,44 +4840,51 @@ namespace
         const float releaseDelay = static_cast<float>(BitingAxesVR::biteReleaseDelay);
         const bool canRelease = elapsed >= releaseDelay;
 
-        const RE::NiPoint3 boneNow = boneWorldAfter.translate;
-        if (canRelease && e.haveLastBonePos &&
-            (boneNow - e.lastBonePos).Length() > static_cast<float>(BitingAxesVR::biteShakeLoose)) {
-            ReleaseEmbed(e, "dislodged");
-            return;
-        }
-        e.lastBonePos = boneNow;
-        e.haveLastBonePos = true;
-
+        // World-model embed: only allow pull-to-dislodge while HIGGS is holding the spawned ref.
+        // Before grab (or after victim restrictions lift), chop follow-through must not orphan the ref.
+        const bool worldAxeHeldByHiggs =
+            e.useWorldAxe && g_higgsInterface && g_higgsInterface->IsHoldingObject(e.isLeft);
+        const bool applyEmbedReleaseChecks = !e.useWorldAxe || worldAxeHeldByHiggs;
         const float handDist = (realHand - woundWorld).Length();
 
-        // During the post-embed delay the axe cannot be pulled free. Once the delay
-        // ends, snapshot how far the controller is from the wound and release when the
-        // player pulls back far enough in 3D (matches real VR controller motion).
-        if (!e.pullBaselineReady && canRelease) {
-            e.pullBaselineDist = handDist;
-            e.pullBaselineReady = true;
-            IW_LOG_INFO("[bite] pull baseline set  hand={}  dist={:.1f}  delay={:.1f}s",
-                        e.isLeft ? "L" : "R", handDist, releaseDelay);
-        }
-
-        if (canRelease && e.pullBaselineReady) {
-            const float pullDistance = static_cast<float>(BitingAxesVR::bitePullDistance);
-            const float pullDelta = handDist - e.pullBaselineDist;
-            if (pullDelta > pullDistance) {
-                ReleaseEmbed(e, "pulled back");
+        if (applyEmbedReleaseChecks) {
+            const RE::NiPoint3 boneNow = boneWorldAfter.translate;
+            if (!e.useWorldAxe && canRelease && e.haveLastBonePos &&
+                (boneNow - e.lastBonePos).Length() > static_cast<float>(BitingAxesVR::biteShakeLoose)) {
+                ReleaseEmbed(e, "dislodged");
                 return;
             }
-        }
+            e.lastBonePos = boneNow;
+            e.haveLastBonePos = true;
 
-        // Safety release if the controller wanders extremely far from the wound.
-        if (canRelease && handDist > static_cast<float>(BitingAxesVR::biteLostDistance)) {
-            ReleaseEmbed(e, "lost distance");
-            return;
-        }
-        if (elapsed > static_cast<float>(BitingAxesVR::biteSafetySeconds)) {
-            ReleaseEmbed(e, "safety timeout");
-            return;
+            // During the post-embed delay the axe cannot be pulled free. Once the delay
+            // ends, snapshot how far the controller is from the wound and release when the
+            // player pulls back far enough in 3D (matches real VR controller motion).
+            if (!e.pullBaselineReady && canRelease) {
+                e.pullBaselineDist = handDist;
+                e.pullBaselineReady = true;
+                IW_LOG_INFO("[bite] pull baseline set  hand={}  dist={:.1f}  delay={:.1f}s",
+                            e.isLeft ? "L" : "R", handDist, releaseDelay);
+            }
+
+            if (canRelease && e.pullBaselineReady) {
+                const float pullDistance = static_cast<float>(BitingAxesVR::bitePullDistance);
+                const float pullDelta = handDist - e.pullBaselineDist;
+                if (pullDelta > pullDistance) {
+                    ReleaseEmbed(e, "pulled back");
+                    return;
+                }
+            }
+
+            // Safety release if the controller wanders extremely far from the wound.
+            if (canRelease && handDist > static_cast<float>(BitingAxesVR::biteLostDistance)) {
+                ReleaseEmbed(e, "lost distance");
+                return;
+            }
+            if (elapsed > static_cast<float>(BitingAxesVR::biteSafetySeconds)) {
+                ReleaseEmbed(e, "safety timeout");
+                return;
+            }
         }
 
         // Controller position along the bite axis (re-centered to the embed-time pose).
@@ -4373,6 +4949,7 @@ namespace
 
     void UpdateEmbedSims()
     {
+        UpdateFlatSwingDiagnostics();
         AuditTrackedWorldAxes();
         UpdateLodgedNpcHold();
         UpdateLodgedAxeVictimEffects();
@@ -4455,7 +5032,7 @@ namespace
                         if (a_event->target) {
                             victim = a_event->target->As<RE::Actor>();
                         }
-                        StartEmbed(hit, victim);  // per-hand gating + weapon classification inside
+                        StartEmbed(hit, victim);  // flat-swing rejection + per-hand gating inside
                     }
                 }
             }
@@ -4519,5 +5096,19 @@ namespace BitingAxesVR::Bite
     {
         EnsureDislodgeSound();
         EnsureBloodImpactDataSet();
+    }
+}
+
+namespace BitingAxesVR::EmbedApi
+{
+    bool BuildHandEmbedSnapshot(bool isLeft, BitingAxesAPI::EmbedSnapshot& outSnapshot)
+    {
+        FillEmbedApiSnapshot(EmbedFor(isLeft), outSnapshot);
+        return true;
+    }
+
+    bool VictimHasLodgedWeapon(RE::Actor* victim)
+    {
+        return VictimHasLodgedAxe(victim);
     }
 }

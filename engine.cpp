@@ -57,11 +57,11 @@ namespace BitingAxesVR
  void LogFalseEdgeVRStatus()
  {
      if (IsFalseEdgeVRPresent()) {
-         IW_LOG_INFO("FalseEdgeVR.dll FOUND in load order — world-model embed uses TRIGGER (release grip to leave weapon in body)");
-         SKSE::log::info("{}: FalseEdgeVR.dll detected; world-model embed input=trigger", kPluginDisplayName);
+         IW_LOG_INFO("FalseEdgeVR.dll FOUND in load order");
+         SKSE::log::info("{}: FalseEdgeVR.dll detected in load order", kPluginDisplayName);
      } else {
-         IW_LOG_INFO("FalseEdgeVR.dll NOT found in load order — world-model embed uses GRIP");
-         SKSE::log::info("{}: FalseEdgeVR.dll not detected; world-model embed input=grip", kPluginDisplayName);
+         IW_LOG_INFO("FalseEdgeVR.dll NOT found in load order");
+         SKSE::log::info("{}: FalseEdgeVR.dll not detected", kPluginDisplayName);
      }
  }
 
