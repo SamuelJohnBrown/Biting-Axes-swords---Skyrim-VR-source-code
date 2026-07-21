@@ -1076,6 +1076,7 @@ namespace
         bool haveWorldAxeHealthDrainTime = false;
         std::chrono::steady_clock::time_point lastPlayerStaminaTick{};
         bool haveLastPlayerStaminaTick = false;
+        float victimDistAtEmbed = -1.0f;  // player-to-victim distance at embed start (-1 = none)
     };
 
     float GetPlayerToActorDistance(RE::Actor* actor)
@@ -3439,14 +3440,8 @@ namespace
         ClearVictimLocomotionState(actor);
         StopVictimLocomotionAnimation(actor);
 
-        if (!hold.planckIgnored && PlanckAPI::g_planck) {
-            PlanckAPI::g_planck->AddIgnoredActor(actor);
-            hold.planckIgnored = true;
-        }
-        if (!hold.ragdollCollisionIgnored && PlanckAPI::g_planck) {
-            PlanckAPI::g_planck->AddRagdollCollisionIgnoredActor(actor);
-            hold.ragdollCollisionIgnored = true;
-        }
+        // No PLANCK ignore here either: it kills per-bone hit resolution, so the free hand
+        // could not bite the held enemy (hits landed on the skeleton root instead).
 
         if (auto* mid = actor->GetMiddleHighProcess()) {
             mid->currentMovementSpeed = 0.0f;
@@ -3648,7 +3643,7 @@ namespace
         }
     }
 
-    void ImmobilizeVictimMovement(EmbedState& e, RE::Actor* actor)
+    void ImmobilizeVictimMovement([[maybe_unused]] EmbedState& e, RE::Actor* actor)
     {
         if (!actor) {
             return;
@@ -3660,15 +3655,9 @@ namespace
         actor->StopMoving(0.0f);
         ClearVictimLocomotionState(actor);
 
-        if (!e.victimPlanckIgnored && PlanckAPI::g_planck) {
-            PlanckAPI::g_planck->AddIgnoredActor(actor);
-            e.victimPlanckIgnored = true;
-        }
-
-        if (!e.victimRagdollCollisionIgnored && PlanckAPI::g_planck) {
-            PlanckAPI::g_planck->AddRagdollCollisionIgnoredActor(actor);
-            e.victimRagdollCollisionIgnored = true;
-        }
+        // Deliberately NOT PLANCK-ignoring the victim here: ignored actors lose per-bone
+        // ragdoll hit resolution (hits report the skeleton root), which blocked the other
+        // hand from embedding the same enemy and made follow-up bites flaky after release.
 
         if (auto* mid = actor->GetMiddleHighProcess()) {
             mid->currentMovementSpeed = 0.0f;
@@ -3845,6 +3834,22 @@ namespace
         }
     }
 
+    // True while the actor is in any attack animation state (melee swing, power attack,
+    // bow draw, etc.). Used to bail out of embeds before the swing yanks the bone.
+    bool IsVictimAttackAnimating(RE::Actor* actor)
+    {
+        if (!actor) {
+            return false;
+        }
+        if (actor->IsAttacking()) {
+            return true;
+        }
+        if (auto* state = actor->AsActorState()) {
+            return state->GetAttackState() != RE::ATTACK_STATE_ENUM::kNone;
+        }
+        return false;
+    }
+
     void ClearVictimActiveAttackState(RE::Actor* actor)
     {
         if (!actor) {
@@ -3881,11 +3886,10 @@ namespace
             return;
         }
 
-        actor->StopCombat();
+        // Only interrupt casting. StopCombat/StopCombatAndAlarmOnActor knocked the victim
+        // out of combat every embed; PLANCK then deactivated their active ragdoll and hits
+        // resolved to the skeleton root (no bone) for several seconds after release.
         actor->InterruptCast(true);
-        if (auto* processLists = RE::ProcessLists::GetSingleton()) {
-            processLists->StopCombatAndAlarmOnActor(actor, true);
-        }
     }
 
     void StopVictimAttacks(EmbedState& e, RE::Actor* actor)
@@ -4607,6 +4611,7 @@ namespace
         e.npcEmbedEligible = false;
         e.gripWasDown = false;
         e.pendingWorldAxeTransition = false;
+        e.victimDistAtEmbed = npcEmbed ? GetPlayerToActorDistance(victim) : -1.0f;
 
         if (npcEmbed) {
             if (IsHeadBoneName(hit.nodeName.c_str()) && profile.allowsHeadshotKill) {
@@ -4783,19 +4788,39 @@ namespace
         }
 
         if (!e.useWorldAxe) {
+            // Victim attack animations yank the struck bone around and stretch/warp the
+            // player's arm — release the moment one starts. Checked BEFORE the restriction
+            // maintenance below, which clears the attack state and would hide it from us.
+            // Short grace so embedding an enemy mid-swing (whose attack we cancel at embed
+            // start) doesn't instantly self-release.
+            if (e.victimActor && IsLivingVictim(e.victimActor.get())) {
+                const float sinceEmbed =
+                    std::chrono::duration<float>(std::chrono::steady_clock::now() - e.startTime).count();
+                if (sinceEmbed > 0.3f && IsVictimAttackAnimating(e.victimActor.get())) {
+                    IW_LOG_INFO("[bite] victim '{}' started an attack while embedded — releasing (hand={})",
+                                e.victimActor->GetDisplayFullName(), e.isLeft ? "L" : "R");
+                    ReleaseEmbed(e, "victim attacking");
+                    return;
+                }
+            }
+
             MaintainVictimEmbedRestrictions(e);
             if (MaintainEmbedPlayerStaminaDrain(e)) {
                 ReleaseEmbed(e, "stamina exhausted");
                 return;
             }
 
-            if (e.victimActor) {
-                const float maxVictimDist = static_cast<float>(BitingAxesVR::biteVictimMaxDistance);
-                if (maxVictimDist > 0.0f) {
+            // Release when the victim has moved away from where they were at embed start.
+            // Relative, not absolute: normal melee range is already ~75-90 units center-to-center,
+            // so an absolute cap released instantly on standing enemies and made biting flaky.
+            if (e.victimActor && e.victimDistAtEmbed >= 0.0f) {
+                const float maxVictimDrift = static_cast<float>(BitingAxesVR::biteVictimMaxDistance);
+                if (maxVictimDrift > 0.0f) {
                     const float victimDist = GetPlayerToActorDistance(e.victimActor.get());
-                    if (victimDist > maxVictimDist) {
-                        IW_LOG_INFO("[bite] victim too far ({:.1f} > {:.1f}) — releasing embed",
-                                    victimDist, maxVictimDist);
+                    if (victimDist >= 0.0f && victimDist - e.victimDistAtEmbed > maxVictimDrift) {
+                        IW_LOG_INFO("[bite] victim moved too far ({:.1f} -> {:.1f}, drift {:.1f} > {:.1f}) — releasing embed",
+                                    e.victimDistAtEmbed, victimDist, victimDist - e.victimDistAtEmbed,
+                                    maxVictimDrift);
                         ReleaseEmbed(e, "victim too far");
                         return;
                     }

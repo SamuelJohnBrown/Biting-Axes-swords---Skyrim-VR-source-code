@@ -17,7 +17,7 @@ namespace BitingAxesVR
  double biteReleaseDelay = 1.75;
  double bitePullDistance = 6.0;
  double biteLostDistance = 90.0;
- double biteVictimMaxDistance = 75.0;
+ double biteVictimMaxDistance = 40.0;
  double biteSafetySeconds = 30.0;
  double biteShakeLoose = 55.0;
  double biteVictimSpeedFrac = 0.0;

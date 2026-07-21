@@ -19,7 +19,7 @@ namespace BitingAxesVR
  extern double biteReleaseDelay;       // seconds after embed before pull-back can release
  extern double bitePullDistance;       // Skyrim units of backward pull required to release
  extern double biteLostDistance;       // controller/wound distance that force-releases embed
- extern double biteVictimMaxDistance;  // player-to-NPC distance that force-releases standard embed (0 = off)
+ extern double biteVictimMaxDistance;  // victim drift away from player since embed start that force-releases (0 = off)
  extern double biteSafetySeconds;      // hard cap on embed duration
  extern double biteShakeLoose;         // bone jump in one frame that dislodges embed
  extern double biteVictimSpeedFrac;    // 0..1: embedded victim speed cap; 0 = immobilize
